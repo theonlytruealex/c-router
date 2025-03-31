@@ -1,6 +1,87 @@
 #include "protocols.h"
 #include "queue.h"
 #include "lib.h"
+#include <arpa/inet.h>
+#include <stdbool.h>
+
+#define IPV4_TYPE 0x0800
+#define ARP_TYPE 0x0806
+#define ETH_HDR_SIZE 0x20
+
+typedef struct trie_node {
+	bool has_children;
+	struct trie_node *children[2];
+	struct route_table_entry *entry;
+} trie_node;
+
+void init_node(trie_node* root) {
+	root->has_children = false;
+	root->children[0] = NULL;
+	root->children[1] = NULL;
+	root->entry = NULL;
+}
+
+void insert(trie_node* root, struct route_table_entry *entry, int position) {
+	if (entry->mask << position == 0) {
+		root->entry = entry;
+		return;
+	}
+
+	u_int32_t prefifx = entry->prefix;
+	bool byte = ((prefifx << position) & 2147483648) >> 31;
+
+	if (!root->has_children)
+		root->has_children = true;
+
+	if (root->children[byte] == NULL)
+		root->children[byte] = (trie_node *)malloc(sizeof(trie_node));
+
+	insert(root->children[byte], entry, position + 1);
+}
+
+struct route_table_entry* get_table_entry(trie_node* root, u_int32_t address, int position) {
+	if (!root->has_children)
+		return root->entry;
+	
+	bool byte = ((address << position) & 2147483648) >> 31;
+
+	if (root->children[byte] == NULL)
+		return root->entry;
+
+	struct route_table_entry *entry = get_table_entry(root->children[byte], address, position + 1);
+	if (entry == NULL)
+		return root->entry;
+	return entry;
+}
+
+int drop_packet(char *frame_data) {
+	return 1;
+}
+
+int drop_dest_mac(uint8_t *address, size_t interface) {
+	for (int i = 0; i < 7; i++) {
+		if (i == 6)
+			return 0;
+
+		if (address[i] != 0xFF)
+			break;
+	}
+	uint8_t mac[6];
+	get_interface_mac(interface, mac);
+
+	for (int i = 0; i < 7; i++) {
+		if (i == 6)
+			return 0;
+
+		if (address[i] != mac[i])
+			break;
+	}
+	return 1;
+}
+
+void icmp_response() {
+
+}
 
 int main(int argc, char *argv[])
 {
@@ -8,6 +89,20 @@ int main(int argc, char *argv[])
 
 	// Do not modify this line
 	init(argv + 2, argc - 2);
+
+	struct route_table_entry *rtable = (struct route_table_entry *)malloc(sizeof(struct route_table_entry) * 80001);
+	struct arp_table_entry *arp_table = (struct arp_table_entry *)malloc(sizeof(struct arp_table_entry) * 3000);
+
+	parse_arp_table("/home/alex/Documents/pcom/homework1-public/arp_table.txt", arp_table);
+
+	int table_len = read_rtable(argv[1], rtable);
+
+	trie_node *root;
+	init_node(root);
+
+	for (int i = 0; i < table_len; i++) {
+		insert(root, &rtable[i], 0);
+	}
 
 
 	while (1) {
@@ -18,6 +113,12 @@ int main(int argc, char *argv[])
 		interface = recv_from_any_link(buf, &len);
 		DIE(interface < 0, "recv_from_any_links");
 
+		struct ether_hdr *eth_header = (struct ether_hdr *) buf;
+		if (drop_dest_mac(eth_header->ethr_dhost, interface)) {
+			drop_packet(buf);
+			continue;
+		}
+
     // TODO: Implement the router forwarding logic
 
     /* Note that packets received are in network order,
@@ -25,7 +126,38 @@ int main(int argc, char *argv[])
 		host order. For example, ntohs(eth_hdr->ether_type). The oposite is needed when
 		sending a packet on the link, */
 
+		if (ntohs(eth_header->ethr_type) == IPV4_TYPE) {
+			struct ip_hdr *ip_header = (struct ip_hdr *)(buf + ETH_HDR_SIZE);
+			
+			uint16_t old_sum = ip_header->checksum;
+
+			ip_header->checksum = 0;
+			if (old_sum != checksum((uint16_t *)ip_header, sizeof(struct ip_hdr)))
+				continue;
+
+			if (ip_header->dest_addr == inet_addr(get_interface_ip(interface))) {
+				icmp_response();
+				continue;
+			}
+
+			if (ip_header->ttl == 0 || ip_header->ttl == 1) {
+				icmp_response();
+				continue;
+			}
+			ip_header->ttl -= 1;
+
+			struct route_table_entry *entry = get_table_entry(root, ip_header->dest_addr, 0);
+			if (entry == NULL) {
+				icmp_response();
+				continue;
+			}
+			ip_header->checksum = 0;
+			ip_header->checksum = checksum((uint16_t *)ip_header, sizeof(struct ip_hdr));
+		}
 
 	}
+	free(rtable);
+	free(arp_table);
+	// TODO FREE TRIE
 }
 
