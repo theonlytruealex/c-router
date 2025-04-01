@@ -7,6 +7,8 @@
 #define IPV4_TYPE 0x0800
 #define ARP_TYPE 0x0806
 #define ETH_HDR_SIZE 0xe
+#define IP_HDR_SIZE 0x14
+#define ICMP_HDR_SIZE 0x8
 
 typedef struct trie_node {
 	short has_children;
@@ -20,6 +22,7 @@ void init_node(trie_node* root) {
 	root->children[1] = NULL;
 	root->entry = NULL;
 }
+
 void print_binary(unsigned int num) {
     for (int i = 31; i >= 0; i--) {
         printf("%d", (num >> i) & 1);
@@ -59,10 +62,6 @@ struct route_table_entry* get_table_entry(trie_node* root, u_int32_t address, in
 	return entry;
 }
 
-int drop_packet(char *frame_data) {
-	return 1;
-}
-
 int drop_dest_mac(uint8_t *address, size_t interface) {
 	for (int i = 0; i < 7; i++) {
 		if (i == 6)
@@ -84,8 +83,39 @@ int drop_dest_mac(uint8_t *address, size_t interface) {
 	return 1;
 }
 
-void icmp_response() {
+void icmp_response(char* buf, int interface, uint8_t type) {
 
+	printf("ICMP, %d\n", type);
+	struct ether_hdr *eth_header = (struct ether_hdr *) buf;
+	uint8_t aux;
+
+	for (int i = 0; i < 6; i++) {
+		aux = eth_header->ethr_dhost[i];
+		eth_header->ethr_dhost[i] = eth_header->ethr_shost[i];
+		eth_header->ethr_shost[i] = aux;
+	}
+	char buf_aux[8 + IP_HDR_SIZE];
+	memcpy(buf_aux, buf + ETH_HDR_SIZE, 8 + IP_HDR_SIZE);
+
+	struct ip_hdr *ip_header = (struct ip_hdr *)(buf + ETH_HDR_SIZE);
+
+	ip_header->dest_addr = ip_header->source_addr;
+	ip_header->source_addr = inet_addr(get_interface_ip(interface));
+	ip_header->ttl = 64;
+	ip_header->proto = 1;
+	ip_header->tot_len = htons(IP_HDR_SIZE + ICMP_HDR_SIZE + IP_HDR_SIZE + 8);
+	ip_header->checksum = 0;
+	ip_header->checksum = htons(checksum((uint16_t *)ip_header, IP_HDR_SIZE));
+	
+	struct icmp_hdr *icmp_header = (struct icmp_hdr *)(buf + ETH_HDR_SIZE + IP_HDR_SIZE);
+	icmp_header->mcode = 0;
+	icmp_header->mtype = type;
+	memcpy(buf + ETH_HDR_SIZE + IP_HDR_SIZE + ICMP_HDR_SIZE, buf_aux, 8 + IP_HDR_SIZE);
+
+	icmp_header->check = 0;
+	icmp_header->check = htons(checksum((uint16_t *)icmp_header, ICMP_HDR_SIZE + IP_HDR_SIZE + 8));
+
+	send_to_link(ETH_HDR_SIZE + IP_HDR_SIZE + ICMP_HDR_SIZE + IP_HDR_SIZE + 8, buf, interface);
 }
 
 int main(int argc, char *argv[])
@@ -116,10 +146,8 @@ int main(int argc, char *argv[])
 		interface = recv_from_any_link(buf, &len);
 		DIE(interface < 0, "recv_from_any_links");
 		struct ether_hdr *eth_header = (struct ether_hdr *) buf;
-		if (drop_dest_mac(eth_header->ethr_dhost, interface)) {
-			drop_packet(buf);
+		if (drop_dest_mac(eth_header->ethr_dhost, interface))
 			continue;
-		}
 
     // TODO: Implement the router forwarding logic
 
@@ -132,22 +160,46 @@ int main(int argc, char *argv[])
 			
 			uint16_t old_sum = ntohs(ip_header->checksum);
 
-			ip_header->checksum = 0;
-			if (old_sum != checksum((uint16_t *)ip_header, sizeof(struct ip_hdr)))
-				continue;
-			if (ip_header->dest_addr == inet_addr(get_interface_ip(interface))) {
-				icmp_response();
-				continue;
-			}
 			if (ip_header->ttl == 0 || ip_header->ttl == 1) {
-				icmp_response();
+				icmp_response(buf, interface, 11);
 				continue;
 			}
+
+			ip_header->checksum = 0;
+			if (old_sum != checksum((uint16_t *)ip_header, IP_HDR_SIZE))
+				continue;
+
+			if (ip_header->dest_addr == inet_addr(get_interface_ip(interface))) {
+				printf("wooo\n");
+				uint8_t aux;
+
+				for (int i = 0; i < 6; i++) {
+					aux = eth_header->ethr_dhost[i];
+					eth_header->ethr_dhost[i] = eth_header->ethr_shost[i];
+					eth_header->ethr_shost[i] = aux;
+				}
+
+				ip_header->dest_addr = ip_header->source_addr;
+				ip_header->source_addr = htonl(inet_addr(get_interface_ip(interface)));
+				ip_header->ttl = 255;
+				ip_header->checksum = 0;
+				ip_header->checksum = htons(checksum((uint16_t *)ip_header, IP_HDR_SIZE));
+
+				struct icmp_hdr *icmp_header = (struct icmp_hdr *)(buf + ETH_HDR_SIZE + IP_HDR_SIZE);
+
+				icmp_header->mtype = 0;
+				icmp_header->check = 0;
+				icmp_header->check = htons(checksum((uint16_t *)ip_header, sizeof(struct icmp_hdr)));
+
+				send_to_link(len, buf, interface);
+				continue;
+			}
+
 			ip_header->ttl -= 1;
 
 			struct route_table_entry *entry = get_table_entry(root, ntohl(ip_header->dest_addr), 0);
 			if (entry == NULL) {
-				icmp_response();
+				icmp_response(buf, interface, 3);
 				continue;
 			}
 			struct arp_table_entry *arp_entry;
@@ -165,7 +217,7 @@ int main(int argc, char *argv[])
 			memcpy(eth_header->ethr_shost, mac, 6);
 
 			ip_header->checksum = 0;
-			ip_header->checksum = htons(checksum((uint16_t *)ip_header, sizeof(struct ip_hdr)));
+			ip_header->checksum = htons(checksum((uint16_t *)ip_header, IP_HDR_SIZE));
 			send_to_link(len, buf, entry->interface);
 		}
 
