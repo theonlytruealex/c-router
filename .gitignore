@@ -30,3 +30,4 @@ hosts_output/forward/router1.pcap
 lib/lib.o
 lib/list.o
 lib/queue.o
+hosts_output/*
