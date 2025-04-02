@@ -62,6 +62,14 @@ struct route_table_entry* get_table_entry(trie_node* root, u_int32_t address, in
 	return entry;
 }
 
+void free_trie(trie_node* root) {
+	if (root->children[0] != NULL)
+		free_trie(root->children[0]);
+	if (root->children[1] != NULL)
+		free_trie(root->children[1]);
+	free(root);
+}
+
 int drop_dest_mac(uint8_t *address, size_t interface) {
 	for (int i = 0; i < 7; i++) {
 		if (i == 6)
@@ -327,6 +335,6 @@ int main(int argc, char *argv[])
 	}
 	free(rtable);
 	free(arp_table);
-	// TODO FREE TRIE
+	free_trie(root);
 }
 
