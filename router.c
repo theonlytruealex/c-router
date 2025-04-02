@@ -83,9 +83,58 @@ int drop_dest_mac(uint8_t *address, size_t interface) {
 	return 1;
 }
 
-void icmp_response(char* buf, int interface, uint8_t type) {
+void send_arp_request(int next_interface, uint32_t dest_ip) {
+	char *req = (char *)malloc(ETH_HDR_SIZE + sizeof(struct arp_hdr));
+	struct ether_hdr *eth_header = (struct ether_hdr *) req;
 
-	printf("ICMP, %d\n", type);
+	eth_header->ethr_type = htons(ARP_TYPE);
+	get_interface_mac(next_interface, eth_header->ethr_shost);
+	for (int i = 0; i < 6; i++)
+		eth_header->ethr_dhost[i] = 0xFF;
+
+	struct arp_hdr *arp_header = (struct arp_hdr *) (req + ETH_HDR_SIZE);
+	arp_header->hw_len = 6;
+	arp_header->hw_type = htons(1);
+	arp_header->opcode = htons(1);
+	arp_header->proto_len = 4;
+	arp_header->proto_type = htons(IPV4_TYPE);
+	arp_header->sprotoa = inet_addr(get_interface_ip(next_interface));
+	arp_header->tprotoa = dest_ip;
+	get_interface_mac(next_interface, arp_header->shwa);
+
+	for (int i = 0; i < 6; i++)
+		arp_header->thwa[i] = 0;
+
+	send_to_link(ETH_HDR_SIZE + sizeof(struct arp_hdr), req, next_interface);
+	free(req);
+}
+
+void recv_arp_request(char *req, ssize_t interface, ssize_t len) {
+	struct ether_hdr *eth_header = (struct ether_hdr *) req;
+	struct arp_hdr *arp_header = (struct arp_hdr *)(req + ETH_HDR_SIZE);
+
+	memcpy(eth_header->ethr_dhost, eth_header->ethr_shost, 6);
+	get_interface_mac(interface, eth_header->ethr_shost);
+
+	eth_header->ethr_type = htons(ARP_TYPE);
+
+	memcpy(arp_header->thwa, arp_header->shwa, 6);
+	get_interface_mac(interface, arp_header->shwa);
+
+	arp_header->tprotoa  = arp_header->sprotoa;
+	arp_header->sprotoa = inet_addr(get_interface_ip(interface));
+
+	arp_header->hw_len = 6;
+	arp_header->hw_type = htons(1);
+	arp_header->opcode = htons(2);
+	arp_header->proto_len = 4;
+	arp_header->proto_type = htons(IPV4_TYPE);
+
+	send_to_link(len, req, interface);
+}
+
+void icmp_response(char* buf, ssize_t interface, uint8_t type) {
+
 	struct ether_hdr *eth_header = (struct ether_hdr *) buf;
 	uint8_t aux;
 
@@ -100,10 +149,10 @@ void icmp_response(char* buf, int interface, uint8_t type) {
 	struct ip_hdr *ip_header = (struct ip_hdr *)(buf + ETH_HDR_SIZE);
 
 	ip_header->dest_addr = ip_header->source_addr;
-	ip_header->source_addr = inet_addr(get_interface_ip(interface));
-	ip_header->ttl = 64;
 	ip_header->proto = 1;
+	ip_header->source_addr = inet_addr(get_interface_ip(interface));
 	ip_header->tot_len = htons(IP_HDR_SIZE + ICMP_HDR_SIZE + IP_HDR_SIZE + 8);
+	ip_header->ttl = 64;
 	ip_header->checksum = 0;
 	ip_header->checksum = htons(checksum((uint16_t *)ip_header, IP_HDR_SIZE));
 	
@@ -125,12 +174,12 @@ int main(int argc, char *argv[])
 	// Do not modify this line
 	init(argv + 2, argc - 2);
 
+	queue arpq = create_queue();
+
 	struct route_table_entry *rtable = (struct route_table_entry *)malloc(sizeof(struct route_table_entry) * 80001);
-	struct arp_table_entry *arp_table = (struct arp_table_entry *)malloc(sizeof(struct arp_table_entry) * 30000);
+	struct arp_table_entry *arp_table = (struct arp_table_entry *)malloc(sizeof(struct arp_table_entry) * 100);
 
-	int arp_len = parse_arp_table("./arp_table.txt", arp_table);
-
-	int table_len = read_rtable(argv[1], rtable);
+	int qlen = 0, arp_len = 0, max_arp_len = 100, table_len = read_rtable(argv[1], rtable);
 
 	trie_node *root = (trie_node *)malloc(sizeof(trie_node));
 	init_node(root);
@@ -170,7 +219,6 @@ int main(int argc, char *argv[])
 				continue;
 
 			if (ip_header->dest_addr == inet_addr(get_interface_ip(interface))) {
-				printf("wooo\n");
 				uint8_t aux;
 
 				for (int i = 0; i < 6; i++) {
@@ -192,6 +240,7 @@ int main(int argc, char *argv[])
 				icmp_header->check = htons(checksum((uint16_t *)ip_header, sizeof(struct icmp_hdr)));
 
 				send_to_link(len, buf, interface);
+				
 				continue;
 			}
 
@@ -202,7 +251,7 @@ int main(int argc, char *argv[])
 				icmp_response(buf, interface, 3);
 				continue;
 			}
-			struct arp_table_entry *arp_entry;
+			struct arp_table_entry *arp_entry = NULL;
 
 			for (int i = 0; i < arp_len; i++) {
 				if (entry->next_hop == arp_table[i].ip){
@@ -210,6 +259,16 @@ int main(int argc, char *argv[])
 					break;
 				}
 			}
+
+			if (arp_entry == NULL) {
+				char *pkt = (char*)malloc(len);
+				memcpy(pkt, buf, len);
+				queue_enq(arpq, pkt);
+				qlen++;
+				send_arp_request(entry->interface, ip_header->dest_addr);
+				continue;
+			}
+
 			uint8_t mac[6];
 			get_interface_mac(interface, mac);
 
@@ -219,8 +278,52 @@ int main(int argc, char *argv[])
 			ip_header->checksum = 0;
 			ip_header->checksum = htons(checksum((uint16_t *)ip_header, IP_HDR_SIZE));
 			send_to_link(len, buf, entry->interface);
-		}
 
+		} else if (ntohs(eth_header->ethr_type) == ARP_TYPE) {
+
+			struct arp_hdr *arp_header = (struct arp_hdr *)(buf + ETH_HDR_SIZE);
+			if (arp_header->opcode == htons(1)) {
+				recv_arp_request(buf, interface, len);
+				continue;
+			}
+			if (arp_len == max_arp_len) {
+				max_arp_len *= 2;
+				arp_table = (struct arp_table_entry *)realloc(arp_table, sizeof(struct arp_table_entry) * max_arp_len);
+			}
+			arp_table[arp_len].ip = arp_header->sprotoa;
+			memcpy(arp_table[arp_len++].mac, arp_header->shwa, 6);
+
+			int q_start_len = qlen;
+			char *pkt;
+			for (int i = 0; i < q_start_len; i++) {
+				pkt = queue_deq(arpq);
+				struct ip_hdr *ip_header = (struct ip_hdr *)(pkt + ETH_HDR_SIZE);
+				struct route_table_entry *entry = get_table_entry(root, ntohl(ip_header->dest_addr), 0);
+				struct arp_table_entry *arp_entry = NULL;
+
+				for (int i = 0; i < arp_len; i++) {
+					if (entry->next_hop == arp_table[i].ip){
+						arp_entry = &arp_table[i];
+						break;
+					}
+				}
+
+				if (arp_entry == NULL) {
+					queue_enq(arpq, pkt);
+					continue;
+				}
+				struct ether_hdr *eth_header = (struct ether_hdr *) pkt;
+				get_interface_mac(entry->interface, eth_header->ethr_shost);
+				memcpy(eth_header->ethr_dhost, arp_entry->mac, 6);
+
+				ip_header->checksum = 0;
+				ip_header->checksum = htons(checksum((uint16_t *)ip_header, IP_HDR_SIZE));
+
+				send_to_link(ETH_HDR_SIZE + ntohs(ip_header->tot_len), pkt, entry->interface);
+				free(pkt);
+				qlen--;
+			}
+		}
 	}
 	free(rtable);
 	free(arp_table);
