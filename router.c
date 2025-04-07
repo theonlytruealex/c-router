@@ -309,11 +309,8 @@ int main(int argc, char *argv[])
 				struct route_table_entry *entry = get_table_entry(root, ntohl(ip_header->dest_addr), 0);
 				struct arp_table_entry *arp_entry = NULL;
 
-				for (int i = 0; i < arp_len; i++) {
-					if (entry->next_hop == arp_table[i].ip){
-						arp_entry = &arp_table[i];
-						break;
-					}
+				if (entry->next_hop == arp_table[arp_len - 1].ip){
+					arp_entry = &arp_table[arp_len - 1];
 				}
 
 				if (arp_entry == NULL) {
