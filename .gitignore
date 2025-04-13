@@ -31,3 +31,4 @@ lib/lib.o
 lib/list.o
 lib/queue.o
 hosts_output/*
+archive.zip
