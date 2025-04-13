@@ -245,7 +245,7 @@ int main(int argc, char *argv[])
 
 				icmp_header->mtype = 0;
 				icmp_header->check = 0;
-				icmp_header->check = htons(checksum((uint16_t *)ip_header, sizeof(struct icmp_hdr)));
+				icmp_header->check = htons(checksum((uint16_t *)icmp_header, sizeof(struct icmp_hdr)));
 
 				send_to_link(len, buf, interface);
 				
